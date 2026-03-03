@@ -316,3 +316,60 @@ func (h *AuthHandler) GetUserCompanies(c *gin.Context) {
 
 	response.Success(c, http.StatusOK, "User companies retrieved successfully", result)
 }
+
+// ForgotPassword handles forgot password request
+// @Summary Forgot password
+// @Description Send a password reset email if the email address is registered
+// @Tags Authentication
+// @Accept json
+// @Produce json
+// @Param request body dto.ForgotPasswordRequest true "User email"
+// @Success 200 {object} response.Response "Reset email sent if account exists"
+// @Failure 400 {object} response.Response "Invalid request payload"
+// @Router /auth/forgot-password [post]
+func (h *AuthHandler) ForgotPassword(c *gin.Context) {
+	var req dto.ForgotPasswordRequest
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Error(c, http.StatusBadRequest, "Invalid request payload", err.Error())
+		return
+	}
+
+	// Always return 200 — don't reveal whether the email exists
+	_ = h.authService.ForgotPassword(&req)
+	response.Success(c, http.StatusOK, "If the email is registered, a password reset link has been sent", nil)
+}
+
+// ResetPassword handles password reset request
+// @Summary Reset password
+// @Description Reset user password using a valid reset token from email
+// @Tags Authentication
+// @Accept json
+// @Produce json
+// @Param request body dto.ResetPasswordRequest true "Reset token and new password"
+// @Success 200 {object} response.Response "Password reset successfully"
+// @Failure 400 {object} response.Response "Invalid token or password"
+// @Failure 500 {object} response.Response "Internal server error"
+// @Router /auth/reset-password [post]
+func (h *AuthHandler) ResetPassword(c *gin.Context) {
+	var req dto.ResetPasswordRequest
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Error(c, http.StatusBadRequest, "Invalid request payload", err.Error())
+		return
+	}
+
+	if err := h.authService.ResetPassword(&req); err != nil {
+		switch {
+		case errors.Is(err, service.ErrPasswordResetTokenNotFound):
+			response.Error(c, http.StatusBadRequest, "Reset link is invalid or has expired", err.Error())
+		case errors.Is(err, service.ErrPasswordResetTokenUsed):
+			response.Error(c, http.StatusBadRequest, "Reset link has already been used", err.Error())
+		default:
+			response.Error(c, http.StatusInternalServerError, "Failed to reset password", err.Error())
+		}
+		return
+	}
+
+	response.Success(c, http.StatusOK, "Password has been reset successfully", nil)
+}

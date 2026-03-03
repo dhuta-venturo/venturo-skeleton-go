@@ -25,18 +25,20 @@ import (
 )
 
 var (
-	ErrInvalidCredentials    = errors.New("invalid credentials")
-	ErrUserNotActive         = errors.New("user is not active")
-	ErrUserNotFound          = errors.New("user not found")
-	ErrEmailAlreadyExists    = errors.New("email already exists")
-	ErrUsernameAlreadyExists = errors.New("username already exists")
-	ErrInvalidPassword       = errors.New("invalid password format")
-	ErrInvalidEmail          = errors.New("invalid email format")
-	ErrInvalidUsername       = errors.New("invalid username format")
-	ErrInvalidRefreshToken   = errors.New("invalid or expired refresh token")
-	ErrRefreshTokenRevoked   = errors.New("refresh token has been revoked")
-	ErrCompanyNotFound       = errors.New("company not found")
-	ErrNotCompanyMember      = errors.New("user is not a member of this company")
+	ErrInvalidCredentials         = errors.New("invalid credentials")
+	ErrUserNotActive              = errors.New("user is not active")
+	ErrUserNotFound               = errors.New("user not found")
+	ErrEmailAlreadyExists         = errors.New("email already exists")
+	ErrUsernameAlreadyExists      = errors.New("username already exists")
+	ErrInvalidPassword            = errors.New("invalid password format")
+	ErrInvalidEmail               = errors.New("invalid email format")
+	ErrInvalidUsername            = errors.New("invalid username format")
+	ErrInvalidRefreshToken        = errors.New("invalid or expired refresh token")
+	ErrRefreshTokenRevoked        = errors.New("refresh token has been revoked")
+	ErrCompanyNotFound            = errors.New("company not found")
+	ErrNotCompanyMember           = errors.New("user is not a member of this company")
+	ErrPasswordResetTokenNotFound = errors.New("reset link is invalid or has expired")
+	ErrPasswordResetTokenUsed     = errors.New("reset link has already been used")
 )
 
 type AuthService struct {
@@ -820,6 +822,126 @@ func (s *AuthService) SwitchCompany(userID string, req *dto.SwitchCompanyRequest
 		ExpiresIn:    expiresIn,
 		Company:      company,
 	}, nil
+}
+
+// ForgotPassword sends a password reset email if the email exists
+func (s *AuthService) ForgotPassword(req *dto.ForgotPasswordRequest) error {
+	logger.Info("Forgot password attempt", logger.String("email", req.Email))
+
+	// Normalize email
+	normalizedEmail := validator.NormalizeEmail(req.Email)
+
+	// Find user by email — silently succeed if not found (don't reveal existence)
+	user, err := s.userRepo.FindByEmail(normalizedEmail)
+	if err != nil || user == nil {
+		logger.Warn("Forgot password: user not found (silently succeeding)", logger.String("email", normalizedEmail))
+		return nil
+	}
+
+	// Rate limit: max 3 reset requests per hour
+	count, err := s.tokenRepo.CountRecentPasswordResetRequests(user.ID, 1*time.Hour)
+	if err == nil && count >= 3 {
+		logger.Warn("Forgot password: rate limit exceeded", logger.String("user_id", user.ID))
+		return nil
+	}
+
+	// Generate password reset token (raw 64-char hex)
+	resetToken, err := token.GeneratePasswordResetToken()
+	if err != nil {
+		logger.Error("Failed to generate password reset token", logger.Err(err))
+		return err
+	}
+
+	// Save token to DB
+	expiresAt := time.Now().Add(getPasswordResetExpiration())
+	if err := s.tokenRepo.CreatePasswordResetToken(user.ID, resetToken, expiresAt, nil, nil); err != nil {
+		logger.Error("Failed to save password reset token", logger.Err(err))
+		return err
+	}
+
+	// Send reset email async
+	go func() {
+		userName := user.Username
+		if user.FullName != nil {
+			userName = *user.FullName
+		}
+		if err := s.emailSvc.SendPasswordResetEmail(user.Email, userName, resetToken); err != nil {
+			logger.Error("Failed to send password reset email",
+				logger.Err(err),
+				logger.String("email", user.Email),
+			)
+		}
+	}()
+
+	logger.Info("Password reset email queued", logger.String("user_id", user.ID))
+	return nil
+}
+
+// ResetPassword resets the user's password using a valid reset token
+func (s *AuthService) ResetPassword(req *dto.ResetPasswordRequest) error {
+	logger.Info("Reset password attempt")
+
+	// Find token by raw value
+	resetToken, err := s.tokenRepo.FindPasswordResetToken(req.Token)
+	if err != nil {
+		logger.Warn("Invalid password reset token", logger.Err(err))
+		return ErrPasswordResetTokenNotFound
+	}
+
+	// Check if already used
+	if resetToken.UsedAt != nil {
+		logger.Warn("Password reset token already used", logger.String("user_id", resetToken.UserID))
+		return ErrPasswordResetTokenUsed
+	}
+
+	// Check if expired
+	if time.Now().After(resetToken.ExpiresAt) {
+		logger.Warn("Password reset token expired", logger.String("user_id", resetToken.UserID))
+		return ErrPasswordResetTokenNotFound
+	}
+
+	// Get user
+	user, err := s.userRepo.FindByID(resetToken.UserID)
+	if err != nil || user == nil {
+		logger.Error("User not found for password reset", logger.String("user_id", resetToken.UserID))
+		return ErrUserNotFound
+	}
+
+	// Hash new password
+	passwordHash, err := crypto.HashPassword(req.NewPassword)
+	if err != nil {
+		logger.Error("Failed to hash new password", logger.Err(err))
+		return err
+	}
+
+	// Update password
+	if err := s.userRepo.UpdatePassword(user.ID, passwordHash, user.ID); err != nil {
+		logger.Error("Failed to update password", logger.Err(err))
+		return err
+	}
+
+	// Mark token as used
+	if err := s.tokenRepo.MarkPasswordResetTokenAsUsed(req.Token); err != nil {
+		logger.Error("Failed to mark reset token as used", logger.Err(err))
+		// Don't fail the operation
+	}
+
+	// Send password changed notification async
+	go func() {
+		userName := user.Username
+		if user.FullName != nil {
+			userName = *user.FullName
+		}
+		if err := s.emailSvc.SendPasswordChangedEmail(user.Email, userName); err != nil {
+			logger.Error("Failed to send password changed email",
+				logger.Err(err),
+				logger.String("email", user.Email),
+			)
+		}
+	}()
+
+	logger.Info("Password reset successful", logger.String("user_id", user.ID))
+	return nil
 }
 
 // GetUserCompanies gets all companies that the user is a member of

@@ -65,7 +65,7 @@ func (m *AuthModule) SetupRoutes(router *gin.RouterGroup) {
 		auth.GET("/companies", middleware.JWTAuth(), m.Handler.GetUserCompanies)
 
 		// auth.POST("/signout", m.Handler.SignOut)
-		// auth.POST("/forgot-password", m.Handler.ForgotPassword)
-		// auth.POST("/reset-password", m.Handler.ResetPassword)
+		auth.POST("/forgot-password", m.Handler.ForgotPassword)
+		auth.POST("/reset-password", m.Handler.ResetPassword)
 	}
 }
